@@ -229,10 +229,54 @@ export async function startHttpServer(client: WhoopClient, opts: HttpServerOptio
     resourceMetadataUrl: `${publicUrl.replace(/\/$/, "")}/.well-known/oauth-protected-resource/mcp`,
   });
 
+  // A request carrying an mcp-session-id we no longer hold (swept after
+  // SESSION_IDLE_MS, or lost to a restart/redeploy). Previously this created a
+  // fresh, uninitialized session and the SDK answered 400 "Server not
+  // initialized" — which clients don't treat as "re-initialize", so the chat
+  // stayed broken until a new one was opened. Instead, serve the request with a
+  // throwaway STATELESS server+transport (sessionIdGenerator undefined skips
+  // session validation), torn down when the response closes. Nothing is added
+  // to `sessions`, so the idle sweep's memory guarantee still holds.
+  async function handleOrphanedRequest(req: Request, res: Response): Promise<void> {
+    const server = new McpServer({ name: "totem", version: "1.5.1" });
+    registerTools(server, client);
+    // No sessionIdGenerator = stateless mode.
+    const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
+    res.on("close", () => {
+      void transport.close().catch(() => undefined);
+      void server.close().catch(() => undefined);
+    });
+    await server.connect(transport as Parameters<typeof server.connect>[0]);
+    await transport.handleRequest(req, res, req.body);
+  }
+
+  const isInitialize = (body: unknown): boolean => {
+    const msgs = Array.isArray(body) ? body : [body];
+    return msgs.some((m) => typeof m === "object" && m !== null && (m as { method?: unknown }).method === "initialize");
+  };
+
   const mcpHandler = async (req: Request, res: Response): Promise<void> => {
     try {
       const sessionIdHeader = req.headers["mcp-session-id"];
       const sid = typeof sessionIdHeader === "string" ? sessionIdHeader : undefined;
+      if (sid && !sessions.has(sid)) {
+        if (req.method === "POST" && !isInitialize(req.body)) {
+          await handleOrphanedRequest(req, res);
+          return;
+        }
+        if (req.method === "DELETE") {
+          // Already gone — nothing to terminate.
+          res.status(200).end();
+          return;
+        }
+        if (req.method === "GET") {
+          // Standalone SSE stream for a session we don't have: per spec, 404
+          // tells the client to start a new session.
+          res.status(404).json({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null });
+          return;
+        }
+        // POST initialize with a stale id: fall through and create a new session.
+      }
       const session = await getOrCreateSession(sid);
       await session.transport.handleRequest(req, res, req.body);
     } catch (err) {
